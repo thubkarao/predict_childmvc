@@ -1,0 +1,866 @@
+---
+title: "Machine Learning Project R Markdown - Collision Prediction"
+author: "Tate HubkaRao"
+date: "2022-08-22"
+note: This Rmd is intended to import CHASE data, and go through the steps of creating machine learning models to predict child AT injury.A seperate model will be made to predict prevelence, as that one will use very different data. 
+output: html_document
+---
+
+### Table of Contents: 
+1) Import library for all relevant packages
+2) Import the datasets from ArcGIS
+3) Clean data and set the seed (cleaning done in STATA)
+4) Split data into city-specific and national datasets
+5) National Analysis
+  5a) Split data into training and testing sets
+  5b) Build the model
+  5c) Predict outcomes
+  5d) Evaluate model
+  5e) Prune tree
+  5f) Evaluate prunes
+6) City-specific Analysis
+  6a) Split data into training and testing sets
+  6b) Build the model
+  6c) Predict outcomes
+  6d) Evaluate model
+  6e) Prune tree
+  6f) Evaluate prunes
+7) Compare National and City-specific trees
+
+```{r echo = F}
+knitr::opts_chunk$set(include=FALSE, # Include = Whether to display the output of the code
+                      echo=FALSE, # Echo = Whether to display code 
+                      eval = TRUE, # Eval = Whether to evaluate the code
+                      tidy = TRUE, # Tidy = Whether to reformat code in a tidy way when displaying it
+                      fig.pos="H",
+                      message = FALSE,
+                      warning=FALSE,
+                      fig.path = "graphs/",
+                      crop=NULL
+                      )
+```
+
+```{r eval = T}
+# Clearing Environments
+rm(list = ls())
+```
+
+## Step 1: Import libraries
+R Version:
+```{r include = TRUE}
+version$version.string
+```
+
+```{r }
+library(conflicted)
+library(sf)
+library(rpart)
+library(rpart.plot)
+library(tidyverse)
+library(caret)
+library(haven)
+library(tree)
+library(vip)
+library(randomForest)
+library(table1)
+library(flextable)
+library(partykit)
+library(basictabler)
+```
+
+Included packages:
+```{r include = TRUE}
+(.packages())
+```
+
+
+## Step 2: Descriptive statistics
+Here, we import the cleaned dataframe from STATA, called 'collision_dta'. This includes all the collisions from all the cities, that fit the inclusion criteria. 
+Inclusion criteria: Collision data must be at victim level, and must be below 18 years old. Dissemination areas must include the length of roadway within the area, and have the population for those below 18 years old. 
+Of note, the data has been previously cleaned in STATA. 
+```{r}
+# Collision by DA dataset
+collision_dta <- read_dta("C:/Users/tateh/OneDrive - University of Calgary/Tate HubkaRao - PhD/Projects/ML Project/Analysis/ML Project Data Clean.dta")
+
+```
+
+These figures show the outcome 'Average Annual collisions' for each dissemination area in the included cities (Toronto, Peel, Calgary, Montreal).
+
+```{r include = T}
+hist(collision_dta$collisions_anu,
+     breaks = 1000,
+     xlim = range(0,3),
+     main = "Average Annual Collisions per DA",
+     xlab = "# of Collisions"
+     )
+```
+
+As we can see, this outcome variable has considerable skew, with almost all DAs having less than 1 collision per year. 
+
+This chunk creates a table showing the descriptive statistics of each city. 
+```{r include = T}
+collision_dta$city = factor(collision_dta$city,
+                            labels = c("Calgary", "Laval", "Montreal", "Peel", "Toronto")
+                            )
+
+factor.collisions_class = factor(collision_dta$collisions_class,
+                                 labels = c("0", ">0-1", ">1-2",">2-3",">3-4", ">4-5", ">5")
+                                 )
+
+label(collision_dta$area) = "Area (km^2)"
+label(collision_dta$child_pro) = "Proportion of children (<=17yrs)"
+label(collision_dta$immigrant_recent_prop) = "Proportion of recent (<5 yrs) immigrants"
+label(collision_dta$house_den) = "Density of housing"
+label(collision_dta$entropie) = "Land use entropie (0=min, 1 = max)"
+label(collision_dta$school_num) = "Number of schools"
+label(collision_dta$road_sum) = "Length of roadway"
+label(collision_dta$collisions_anu) = "Number of collisions per year"
+label(factor.collisions_class) = "Grouped # of collisions per year"
+
+table1(~ area + child_pro + immigrant_recent_prop + house_den + entropie + school_num + road_sum + collisions_anu + factor.collisions_class| city,
+       data = collision_dta,
+       render.continuous = "mean (sd)",
+       #render.categorical,
+       caption = "Table 1. Characteristics of dissemination areas, by city/region",
+       footnote = "Note: Data are the mean (sd) averaged accross all dissemination areas in each city/region."
+       )
+```
+
+```{r include = T}
+label(collision_dta$area) = "Area (km^2)"
+label(collision_dta$child_pro) = "Proportion of children (<=17yrs)"
+label(collision_dta$immigrant_recent_prop) = "Proportion of recent (<5 yrs) immigrants"
+label(collision_dta$house_den) = "Density of housing"
+label(collision_dta$entropie) = "Land use entropie (0=min, 1 = max)"
+label(collision_dta$school_num) = "Number of schools"
+label(collision_dta$road_sum) = "Length of roadway"
+label(collision_dta$collisions_anu) = "Number of collisions per year"
+label(factor.collisions_class) = "Grouped # of collisions per year"
+
+table1(~ area + child_pro + immigrant_recent_prop + house_den + entropie + school_num + road_sum + collisions_anu + factor.collisions_class| city,
+       data = collision_dta,
+       render.continuous = "median (iqr)",
+       #render.categorical,
+       caption = "Table 1. Characteristics of dissemination areas, by city/region",
+       footnote = "Note: Data are the median (iqr) accross all dissemination areas in each city/region."
+       )
+```
+
+
+## Step 3: Set the seed
+To ensure reproducibility of these models, we will set the set prior to any datawork. We will set the seed at 15. 
+```{r}
+# Set the seed prior to doing any further work
+seed = 15
+```
+
+## Split data into National and City-Specific datasets
+This code removes all variations of the outcome variable. 
+```{r}
+#names(collision_dta)
+collision_df = subset(collision_dta,
+  select = -c(collisions_anu_per, collisions_class, collisions_class_anu, collisions,
+              years, province, dissemination_area,
+              guards_num, guard_prop
+              ))
+```
+
+Included variables (predictors and outcomes):
+```{r}
+names(collision_df)
+```
+
+
+### Step 5: National Analysis
+We will first conduct our analysis on all of the data, looking at it from a Canada-wide perspective. 
+
+## Step 5a: Split data into training and testing data
+We will be splitting the dataset into two components, the training dataset and the testing dataset. Each dataset will have a portion of the full dataset (80% and 20% respectively).This code does a stratified split, based on the city. So the training dataset is 80% of the data from each city. We also remove the city variable from the dataset, to prevent the tree from splitting based on city. This ensure the final model is as generalizable to any city as possible. A secondary model for each city can be constructed to incorporate city-specific characteristics. 
+```{r}
+set.seed(seed)
+split_ind = createDataPartition(y=collision_df$city,
+                                p=0.80,
+                                list = FALSE
+                                )
+
+train = subset(collision_df[split_ind, ])
+test = subset(collision_df[-split_ind, ])
+
+train_nocity = subset(train, select = -c(city))
+test_nocity = subset(test, select = -c(city))
+```
+
+## Step 5b: Build the model
+As the outcome variable is a count (number of collisions), we will be using a Poisson Regression Tree for our model. Due to each city supplying a different number of years worth of data, we will consider the number of years of data provided as the time component, creating an outcome of number of collisions per year. 
+
+```{r}
+# This chunk specifies the control pieces of the model. As there are multiple models being built using the same characteristics, this saves space
+minsplit = 20
+
+control = rpart.control(
+  xval = 10,  
+  minsplit = 20,
+  minbucket = round(minsplit/3),
+  cp = 0.01,
+  maxcompete = 4, 
+  maxsurrogate = 5, 
+  usesurrogate = 2, 
+  surrogatestyle = 0, 
+  maxdepth = 30
+  )
+```
+
+
+```{r}
+set.seed(seed)
+model = rpart(
+  formula = collisions_anu ~. ,   
+  data = train,   
+  method = 'poisson' , 
+  control = control
+  )
+model_nocity = rpart(
+  formula = collisions_anu ~. ,   
+  data = train_nocity,   
+  method = 'poisson' , 
+  control = control
+  )
+```
+
+```{r include = T}
+rpart.plot(model,
+           main = "Poisson Regression Tree of Collisions per year"
+           )
+rpart.plot(model_nocity,
+           main = "Poisson Regression Tree of Collisions per year (without city variable)"
+           )
+```
+
+### Interpreting the tree output:  
+There are three values per node in the tree.  
+1) The first one specifies the average number of collisions per year, among the DAs that belong to that node  
+2) The second specifies "the sum of collisions accross all DAs / the number of DAs"  
+3)  The third specifies the proportion of DAs, out of the entire dataset, that belong to that node  
+
+E.g., Node 9 (Terminal)  
+- The mean collisions per year for these DAs is 0.11  
+- There are 1955 collisions accross 1030 included DAs  
+- This node includes 31% of all DAs  
+
+
+
+## Step 5c: Predict the outcomes and measure performance
+
+First, we will use the model we just created to predict the number of collisions per year, in the train and test dataset. 
+```{r}
+set.seed(seed)
+predict_train = predict(model,
+  newdata = train,
+  #type = "vector",
+  #level = 0.95
+  )
+predict_test = predict(model,
+  newdata = test,
+  #type = "vector",
+  #level = 0.95
+  )
+
+predict_train_nocity = predict(model_nocity,
+  newdata = train_nocity,
+  #type = "vector",
+  #level = 0.95
+  )
+predict_test_nocity = predict(model_nocity,
+  newdata = test_nocity,
+  #type = "vector",
+  #level = 0.95
+  )
+```
+
+Now, we can look at both the train and test sets, in terms of their accuracy. This will compare the actual number of collisions per year in each DA, to the predicted number. We will do this by calculating the sqaured residuals, or the number of collisions per year we observed, minus the number of collisions per year we predicted, sqaured. We will do this for both the training and testing datasets. 
+
+```{r include = T}
+set.seed(seed)
+res_train = (predict_train - train$collisions_anu)^2
+res_train_nocity = (predict_train_nocity - train_nocity$collisions_anu)^2
+
+res_test = (predict_test - test$collisions_anu)^2
+res_test_nocity = (predict_test_nocity - test_nocity$collisions_anu)^2
+
+train_rmse = RMSE(predict_train, train$collisions_anu)
+test_rmse = RMSE(predict_test, test$collisions_anu)
+train_rmse_nocity = RMSE(predict_train_nocity, train_nocity$collisions_anu)
+test_rmse_nocity = RMSE(predict_test_nocity, test_nocity$collisions_anu)
+
+national_table = BasicTable$new()
+national_table$cells$setCell(1, 1, cellType="root", rawValue="National Model")
+national_table$cells$setCell(1, 2, cellType="columnHeader", rawValue="Train RSME")
+national_table$cells$setCell(1, 3, cellType="columnHeader", rawValue="Test RSME")
+
+national_table$cells$setCell(2, 1, cellType="cell", rawValue="With City Variable")
+national_table$cells$setCell(2, 2, cellType="cell", rawValue=train_rmse)
+national_table$cells$setCell(2, 3, cellType="cell", rawValue=test_rmse)
+
+national_table$cells$setCell(3, 1, cellType="cell", rawValue="Without City Variable")
+national_table$cells$setCell(3, 2, cellType="cell", rawValue=train_rmse_nocity)
+national_table$cells$setCell(3, 3, cellType="cell", rawValue=test_rmse_nocity)
+
+national_table$renderTable()
+```
+We can also get a figure showing the relative error in the R-Squared value based on differing levels of the complexity parameter (cp). By changing the cp in our model, we can influence how many splits occur in our tree. With larger cp values, we can limit the number of splits by ensuring the model only splits if the overall R-squared increases by the cp. This is based on the training data. 
+```{r}
+# Can we get the test and train line in one graph?
+plotcp(model)
+plotcp(model_nocity)
+```
+
+Measure the importance of each variable
+```{r eval = T, include = T}
+set.seed(seed)
+var_importance = vip::vip(model)
+var_importance_nocity = vip::vip(model_nocity)
+print(var_importance)
+print(var_importance_nocity)
+vip::vi(model)
+vip::vi(model_nocity)
+```
+
+## Prune the tree
+
+Now that we have a full tree, and evaluated it's performance, we can see whether pruning it a bit helps. 
+```{r}
+# This code determines what the minimum cp value is ...
+set.seed(seed)
+mincp <- model$cptable[which.min(model$cptable[,"xerror"]),"CP"]
+mincp_nocity <- model_nocity$cptable[which.min(model_nocity$cptable[,"xerror"]),"CP"]
+
+# This is the code to create a pruned tree, using the minimum cp value
+pmodel<- prune(model, cp=mincp) # from cptable   
+pmodel_nocity<- prune(model_nocity, cp=mincp_nocity) # from cptable   
+print(mincp)
+print(mincp_nocity)
+```
+
+
+So here is our final tree:
+```{r include = T}
+rpart.plot(pmodel,
+           main = "Poisson Regression Tree of Collisions per year, Pruned"
+           )
+rpart.plot(pmodel_nocity,
+           main = "Poisson Regression Tree of Collisions per year, Pruned (No city variable)"
+           )
+```
+
+
+```{r}
+set.seed(seed)
+predict_ptrain = predict(pmodel,
+  newdata = train,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest = predict(pmodel,
+  newdata = test,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptrain_nocity = predict(pmodel_nocity,
+  newdata = train_nocity,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest_nocity = predict(pmodel_nocity,
+  newdata = test_nocity,
+  type = "vector",
+  level = 0.95
+  )
+```
+
+
+```{r include = T}
+set.seed(seed)
+pres_train = (predict_ptrain - train$collisions_anu)^2
+pres_train_nocity = (predict_ptrain_nocity - train_nocity$collisions_anu)^2
+
+pres_test = (predict_ptest - test$collisions_anu)^2
+pres_test_nocity = (predict_ptest_nocity - test_nocity$collisions_anu)^2
+
+train_prmse = RMSE(predict_ptrain, train$collisions_anu)
+test_prmse = RMSE(predict_ptest, test$collisions_anu)
+train_prmse_nocity = RMSE(predict_ptrain_nocity, train_nocity$collisions_anu)
+test_prmse_nocity = RMSE(predict_ptest_nocity, test_nocity$collisions_anu)
+
+national_tablep = BasicTable$new()
+national_tablep$cells$setCell(1, 1, cellType="root", rawValue="National Model")
+national_tablep$cells$setCell(1, 2, cellType="columnHeader", rawValue="Train RSME")
+national_tablep$cells$setCell(1, 3, cellType="columnHeader", rawValue="Test RSME")
+national_tablep$cells$setCell(1, 4, cellType="columnHeader", rawValue="Train RSME - Pruned")
+national_tablep$cells$setCell(1, 5, cellType="columnHeader", rawValue="Test RSME - Pruned")
+
+national_tablep$cells$setCell(2, 1, cellType="cell", rawValue="With City Variable")
+national_tablep$cells$setCell(2, 2, cellType="cell", rawValue=train_rmse)
+national_tablep$cells$setCell(2, 3, cellType="cell", rawValue=test_rmse)
+national_tablep$cells$setCell(2, 4, cellType="cell", rawValue=train_prmse)
+national_tablep$cells$setCell(2, 5, cellType="cell", rawValue=test_prmse)
+
+national_tablep$cells$setCell(3, 1, cellType="cell", rawValue="Without City Variable")
+national_tablep$cells$setCell(3, 2, cellType="cell", rawValue=train_rmse_nocity)
+national_tablep$cells$setCell(3, 3, cellType="cell", rawValue=test_rmse_nocity)
+national_tablep$cells$setCell(3, 4, cellType="cell", rawValue=train_prmse_nocity)
+national_tablep$cells$setCell(3, 5, cellType="cell", rawValue=test_prmse_nocity)
+
+national_tablep$renderTable()
+```
+
+Measure the importance of each variable
+```{r eval = T, include = T}
+set.seed(seed)
+var_importancep = vip::vip(pmodel)
+var_importance_pnocity = vip::vip(pmodel_nocity)
+print(var_importancep)
+print(var_importance_pnocity)
+vip::vi(pmodel)
+vip::vi(pmodel_nocity)
+```
+
+### City-specific models
+
+We will redo all of the above, but for each city seperatly. This will allow us to compare them, and see whether a prediction model for all cities would be better or worse, than a city-specific one. 
+
+## Step 6a) Split data into training and testing sets
+
+```{r}
+# This will create a training and testing dataset for each city
+set.seed(seed)
+train_cal = subset(collision_df[split_ind, ], city == "Calgary", select = -c(city)) 
+train_pee = subset(collision_df[split_ind, ], city == "Peel", select = -c(city))
+train_tor = subset(collision_df[split_ind, ], city == "Toronto", select = -c(city))
+train_mon = subset(collision_df[split_ind, ], city == "Montreal", select = -c(city))
+train_lav = subset(collision_df[split_ind, ], city == "Laval", select = -c(city))
+
+test_cal = subset(collision_df[-split_ind, ], city == "Calgary", select = -c(city))
+test_pee = subset(collision_df[-split_ind, ], city == "Peel", select = -c(city))
+test_tor = subset(collision_df[-split_ind, ], city == "Toronto", select = -c(city))
+test_mon = subset(collision_df[-split_ind, ], city == "Montreal", select = -c(city))
+test_lav = subset(collision_df[-split_ind, ], city == "Laval", select = -c(city))
+```
+
+## Step 6b) Build the model
+
+```{r}
+# Now for a model for each city
+set.seed(seed)
+model_cal = rpart(
+  formula = collisions_anu ~.,
+  data = train_cal,   
+  method = 'poisson', 
+  control = control
+  )
+model_pee = rpart(
+  formula = collisions_anu ~.,   
+  data = train_pee,   
+  method = 'poisson' , 
+  control = control
+  )
+model_tor = rpart(
+  formula = collisions_anu ~.,   
+  data = train_tor,   
+  method = 'poisson' , 
+  control = control
+  )
+model_mon = rpart(
+  formula = collisions_anu ~.,   
+  data = train_mon,   
+  method = 'poisson' , 
+  control = control
+  )
+model_lav = rpart(
+  formula = collisions_anu ~.,   
+  data = train_lav,   
+  method = 'poisson' , 
+  control = control
+  )
+```
+
+```{r include = T}
+rpart.plot(model_cal,
+           main = "Poisson Regression Tree of Collisions per year in Calgary"
+           )
+rpart.plot(model_pee,
+           main = "Poisson Regression Tree of Collisions per year in Peel Region"
+           )
+rpart.plot(model_tor,
+           main = "Poisson Regression Tree of Collisions per year in Toronto"
+           )
+rpart.plot(model_mon,
+           main = "Poisson Regression Tree of Collisions per year in Montreal"
+           )
+rpart.plot(model_lav,
+           main = "Poisson Regression Tree of Collisions per year in Laval"
+           )
+```
+
+## Step  6c) Predict outcomes
+
+```{r}
+set.seed(seed)
+predict_train_cal = predict(model_cal,
+  newdata = train_cal,
+  type = "vector",
+  level = 0.95
+  )
+predict_train_pee = predict(model_pee,
+  newdata = train_pee,
+  type = "vector",
+  level = 0.95
+  )
+predict_train_tor = predict(model_tor,
+  newdata = train_tor,
+  type = "vector",
+  level = 0.95
+  )
+predict_train_mon = predict(model_mon,
+  newdata = train_mon,
+  type = "vector",
+  level = 0.95
+  )
+predict_train_lav = predict(model_lav,
+  newdata = train_lav,
+  type = "vector",
+  level = 0.95
+  )
+
+predict_test_cal = predict(model_cal,
+  newdata = test_cal,
+  type = "vector",
+  level = 0.95
+  )
+predict_test_pee = predict(model_pee,
+  newdata = test_pee,
+  type = "vector",
+  level = 0.95
+  )
+predict_test_tor = predict(model_tor,
+  newdata = test_tor,
+  type = "vector",
+  level = 0.95
+  )
+predict_test_mon = predict(model_mon,
+  newdata = test_mon,
+  type = "vector",
+  level = 0.95
+  )
+predict_test_lav = predict(model_lav,
+  newdata = test_lav,
+  type = "vector",
+  level = 0.95
+  )
+```
+
+## Step 6d) Evaluate model
+
+```{r include = T}
+set.seed(seed)
+train_cal_rmse = RMSE(predict_train_cal, train_cal$collisions_anu)
+train_pee_rmse = RMSE(predict_train_pee, train_pee$collisions_anu)
+train_tor_rmse = RMSE(predict_train_tor, train_tor$collisions_anu)
+train_mon_rmse = RMSE(predict_train_mon, train_mon$collisions_anu)
+train_lav_rmse = RMSE(predict_train_lav, train_lav$collisions_anu)
+
+test_cal_rmse = RMSE(predict_test_cal, test_cal$collisions_anu)
+test_pee_rmse = RMSE(predict_test_pee, test_pee$collisions_anu)
+test_tor_rmse = RMSE(predict_test_tor, test_tor$collisions_anu)
+test_mon_rmse = RMSE(predict_test_mon, test_mon$collisions_anu)
+test_lav_rmse = RMSE(predict_test_lav, test_lav$collisions_anu)
+  
+city_table = BasicTable$new()
+city_table$cells$setCell(1, 1, cellType="root", rawValue="City-specific Model")
+city_table$cells$setCell(1, 2, cellType="columnHeader", rawValue="Train RSME")
+city_table$cells$setCell(1, 3, cellType="columnHeader", rawValue="Test RSME")
+
+city_table$cells$setCell(2, 1, cellType="cell", rawValue="Calgary")
+city_table$cells$setCell(2, 2, cellType="cell", rawValue=train_cal_rmse)
+city_table$cells$setCell(2, 3, cellType="cell", rawValue=test_cal_rmse)
+
+city_table$cells$setCell(3, 1, cellType="cell", rawValue="Peel Region")
+city_table$cells$setCell(3, 2, cellType="cell", rawValue=train_pee_rmse)
+city_table$cells$setCell(3, 3, cellType="cell", rawValue=test_pee_rmse)
+
+city_table$cells$setCell(4, 1, cellType="cell", rawValue="Toronto")
+city_table$cells$setCell(4, 2, cellType="cell", rawValue=train_tor_rmse)
+city_table$cells$setCell(4, 3, cellType="cell", rawValue=test_tor_rmse)
+
+city_table$cells$setCell(5, 1, cellType="cell", rawValue="Montreal")
+city_table$cells$setCell(5, 2, cellType="cell", rawValue=train_mon_rmse)
+city_table$cells$setCell(5, 3, cellType="cell", rawValue=test_mon_rmse)
+
+city_table$cells$setCell(6, 1, cellType="cell", rawValue="Laval")
+city_table$cells$setCell(6, 2, cellType="cell", rawValue=train_lav_rmse)
+city_table$cells$setCell(6, 3, cellType="cell", rawValue=test_lav_rmse)
+
+city_table$renderTable()
+
+```
+
+Measure the importance of each variable
+```{r eval = T, include = T}
+set.seed(seed)
+var_importance_cal = vip::vip(model_cal)
+var_importance_pee = vip::vip(model_pee)
+var_importance_tor = vip::vip(model_tor)
+var_importance_mon = vip::vip(model_mon)
+var_importance_lav = vip::vip(model_lav)
+print(var_importance_cal)
+print(var_importance_pee)
+print(var_importance_tor)
+print(var_importance_mon)
+print(var_importance_lav)
+vip::vi(model_cal)
+vip::vi(model_pee)
+vip::vi(model_tor)
+vip::vi(model_mon)
+vip::vi(model_lav)
+```
+## Step 6e) Prune tree
+
+```{r}
+# This code determines what the minimum cp value is ...
+set.seed(seed)
+mincp_cal <- model_cal$cptable[which.min(model_cal$cptable[,"xerror"]),"CP"]
+mincp_pee <- model_pee$cptable[which.min(model_pee$cptable[,"xerror"]),"CP"]
+mincp_tor <- model_tor$cptable[which.min(model_tor$cptable[,"xerror"]),"CP"]
+mincp_mon <- model_mon$cptable[which.min(model_mon$cptable[,"xerror"]),"CP"]
+mincp_lav <- model_lav$cptable[which.min(model_lav$cptable[,"xerror"]),"CP"]
+
+# This is the code to create a pruned tree, using the minimum cp value
+pmodel_cal<- prune(model_cal, cp=mincp_cal)  
+pmodel_pee<- prune(model_pee, cp=mincp_pee)  
+pmodel_tor<- prune(model_tor, cp=mincp_tor)  
+pmodel_mon<- prune(model_mon, cp=mincp_mon)  
+pmodel_lav<- prune(model_lav, cp=mincp_lav)  
+
+print(paste("Calgary mincp:", mincp_cal))
+print(paste("Peel mincp:", mincp_pee))
+print(paste("Toronto mincp:", mincp_tor))
+print(paste("Montreal mincp:", mincp_mon))
+print(paste("Laval mincp:", mincp_lav))
+```
+
+```{r include = T}
+rpart.plot(pmodel_cal,
+           main = "Poisson Regression Tree of Collisions per year in Calgary, Pruned"
+           )
+rpart.plot(pmodel_pee,
+           main = "Poisson Regression Tree of Collisions per year in Peel Region, Pruned"
+           )
+rpart.plot(pmodel_tor,
+           main = "Poisson Regression Tree of Collisions per year in Toronto, Pruned"
+           )
+rpart.plot(pmodel_mon,
+           main = "Poisson Regression Tree of Collisions per year in Montreal, Pruned"
+           )
+rpart.plot(pmodel_lav,
+           main = "Poisson Regression Tree of Collisions per year in Laval, Pruned"
+           )
+```
+
+```{r}
+set.seed(seed)
+predict_ptrain_cal = predict(model_cal,
+  newdata = train_cal,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptrain_pee = predict(model_pee,
+  newdata = train_pee,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptrain_tor = predict(model_tor,
+  newdata = train_tor,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptrain_mon = predict(model_mon,
+  newdata = train_mon,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptrain_lav = predict(model_lav,
+  newdata = train_lav,
+  type = "vector",
+  level = 0.95
+  )
+
+predict_ptest_cal = predict(model_cal,
+  newdata = test_cal,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest_pee = predict(model_pee,
+  newdata = test_pee,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest_tor = predict(model_tor,
+  newdata = test_tor,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest_mon = predict(model_mon,
+  newdata = test_mon,
+  type = "vector",
+  level = 0.95
+  )
+predict_ptest_lav = predict(model_lav,
+  newdata = test_lav,
+  type = "vector",
+  level = 0.95
+  )
+```
+
+## Step 6f) Evaluate prunes
+```{r include = T}
+set.seed(seed)
+train_cal_prmse = RMSE(predict_ptrain_cal, train_cal$collisions_anu)
+train_pee_prmse = RMSE(predict_ptrain_pee, train_pee$collisions_anu)
+train_tor_prmse = RMSE(predict_ptrain_tor, train_tor$collisions_anu)
+train_mon_prmse = RMSE(predict_ptrain_mon, train_mon$collisions_anu)
+train_lav_prmse = RMSE(predict_ptrain_lav, train_lav$collisions_anu)
+
+test_cal_prmse = RMSE(predict_ptest_cal, test_cal$collisions_anu)
+test_pee_prmse = RMSE(predict_ptest_pee, test_pee$collisions_anu)
+test_tor_prmse = RMSE(predict_ptest_tor, test_tor$collisions_anu)
+test_mon_prmse = RMSE(predict_ptest_mon, test_mon$collisions_anu)
+test_lav_prmse = RMSE(predict_ptest_lav, test_lav$collisions_anu)
+
+city_tablep = BasicTable$new()
+city_tablep$cells$setCell(1, 1, cellType="root", rawValue="City-specific Model")
+city_tablep$cells$setCell(1, 2, cellType="columnHeader", rawValue="Train RSME")
+city_tablep$cells$setCell(1, 3, cellType="columnHeader", rawValue="Test RSME")
+city_tablep$cells$setCell(1, 4, cellType="columnHeader", rawValue="Train RSME - Pruned")
+city_tablep$cells$setCell(1, 5, cellType="columnHeader", rawValue="Test RSME - Pruned")
+
+city_tablep$cells$setCell(2, 1, cellType="cell", rawValue="Calgary")
+city_tablep$cells$setCell(2, 2, cellType="cell", rawValue=train_cal_rmse)
+city_tablep$cells$setCell(2, 3, cellType="cell", rawValue=test_cal_rmse)
+city_tablep$cells$setCell(2, 4, cellType="cell", rawValue=train_cal_prmse)
+city_tablep$cells$setCell(2, 5, cellType="cell", rawValue=test_cal_prmse)
+
+city_tablep$cells$setCell(3, 1, cellType="cell", rawValue="Peel Region")
+city_tablep$cells$setCell(3, 2, cellType="cell", rawValue=train_pee_rmse)
+city_tablep$cells$setCell(3, 3, cellType="cell", rawValue=test_pee_rmse)
+city_tablep$cells$setCell(3, 4, cellType="cell", rawValue=train_pee_prmse)
+city_tablep$cells$setCell(3, 5, cellType="cell", rawValue=test_pee_prmse)
+
+city_tablep$cells$setCell(4, 1, cellType="cell", rawValue="Toronto")
+city_tablep$cells$setCell(4, 2, cellType="cell", rawValue=train_tor_rmse)
+city_tablep$cells$setCell(4, 3, cellType="cell", rawValue=test_tor_rmse)
+city_tablep$cells$setCell(4, 4, cellType="cell", rawValue=train_tor_prmse)
+city_tablep$cells$setCell(4, 5, cellType="cell", rawValue=test_tor_prmse)
+
+city_tablep$cells$setCell(5, 1, cellType="cell", rawValue="Montreal")
+city_tablep$cells$setCell(5, 2, cellType="cell", rawValue=train_mon_rmse)
+city_tablep$cells$setCell(5, 3, cellType="cell", rawValue=test_mon_rmse)
+city_tablep$cells$setCell(5, 4, cellType="cell", rawValue=train_mon_prmse)
+city_tablep$cells$setCell(5, 5, cellType="cell", rawValue=test_mon_prmse)
+
+city_tablep$cells$setCell(6, 1, cellType="cell", rawValue="Laval")
+city_tablep$cells$setCell(6, 2, cellType="cell", rawValue=train_lav_rmse)
+city_tablep$cells$setCell(6, 3, cellType="cell", rawValue=test_lav_rmse)
+city_tablep$cells$setCell(6, 4, cellType="cell", rawValue=train_lav_prmse)
+city_tablep$cells$setCell(6, 5, cellType="cell", rawValue=test_lav_prmse)
+
+city_tablep$renderTable()
+
+```
+
+Measure the importance of each pruned variable
+```{r eval = T, include = T}
+set.seed(seed)
+var_importance_pcal = vip::vip(pmodel_cal)
+var_importance_ppee = vip::vip(pmodel_pee)
+var_importance_ptor = vip::vip(pmodel_tor)
+var_importance_pmon = vip::vip(pmodel_mon)
+var_importance_plav = vip::vip(pmodel_lav)
+print(var_importance_pcal)
+print(var_importance_ppee)
+print(var_importance_ptor)
+print(var_importance_pmon)
+print(var_importance_plav)
+vip::vi(pmodel_cal)
+vip::vi(pmodel_pee)
+vip::vi(pmodel_tor)
+vip::vi(pmodel_mon)
+vip::vi(pmodel_lav)
+```
+```{r}
+vip_ppee = as.data.frame(vip::vi(pmodel_pee))
+vip_ppee
+```
+
+
+## Step 7 Evaluate prunes
+```{r include = T}
+compare_table = BasicTable$new()
+compare_table$cells$setCell(1, 1, cellType="root", rawValue="Model")
+compare_table$cells$setCell(1, 2, cellType="columnHeader", rawValue="Train RSME")
+compare_table$cells$setCell(1, 3, cellType="columnHeader", rawValue="Test RSME")
+compare_table$cells$setCell(1, 4, cellType="columnHeader", rawValue="Train RSME - Pruned")
+compare_table$cells$setCell(1, 5, cellType="columnHeader", rawValue="Test RSME - Pruned")
+
+compare_table$cells$setCell(2, 1, cellType="cell", rawValue="National With City Variable")
+compare_table$cells$setCell(2, 2, cellType="cell", rawValue=train_rmse)
+compare_table$cells$setCell(2, 3, cellType="cell", rawValue=test_rmse)
+compare_table$cells$setCell(2, 4, cellType="cell", rawValue=train_prmse)
+compare_table$cells$setCell(2, 5, cellType="cell", rawValue=test_prmse)
+
+compare_table$cells$setCell(3, 1, cellType="cell", rawValue="National Without City Variable")
+compare_table$cells$setCell(3, 2, cellType="cell", rawValue=train_rmse_nocity)
+compare_table$cells$setCell(3, 3, cellType="cell", rawValue=test_rmse_nocity)
+compare_table$cells$setCell(3, 4, cellType="cell", rawValue=train_prmse_nocity)
+compare_table$cells$setCell(3, 5, cellType="cell", rawValue=test_prmse_nocity)
+
+compare_table$cells$setCell(4, 1, cellType="cell", rawValue="Calgary")
+compare_table$cells$setCell(4, 2, cellType="cell", rawValue=train_cal_rmse)
+compare_table$cells$setCell(4, 3, cellType="cell", rawValue=test_cal_rmse)
+compare_table$cells$setCell(4, 4, cellType="cell", rawValue=train_cal_prmse)
+compare_table$cells$setCell(4, 5, cellType="cell", rawValue=test_cal_prmse)
+
+compare_table$cells$setCell(5, 1, cellType="cell", rawValue="Peel Region")
+compare_table$cells$setCell(5, 2, cellType="cell", rawValue=train_pee_rmse)
+compare_table$cells$setCell(5, 3, cellType="cell", rawValue=test_pee_rmse)
+compare_table$cells$setCell(5, 4, cellType="cell", rawValue=train_pee_prmse)
+compare_table$cells$setCell(5, 5, cellType="cell", rawValue=test_pee_prmse)
+
+compare_table$cells$setCell(6, 1, cellType="cell", rawValue="Toronto")
+compare_table$cells$setCell(6, 2, cellType="cell", rawValue=train_tor_rmse)
+compare_table$cells$setCell(6, 3, cellType="cell", rawValue=test_tor_rmse)
+compare_table$cells$setCell(6, 4, cellType="cell", rawValue=train_tor_prmse)
+compare_table$cells$setCell(6, 5, cellType="cell", rawValue=test_tor_prmse)
+
+compare_table$cells$setCell(7, 1, cellType="cell", rawValue="Montreal")
+compare_table$cells$setCell(7, 2, cellType="cell", rawValue=train_mon_rmse)
+compare_table$cells$setCell(7, 3, cellType="cell", rawValue=test_mon_rmse)
+compare_table$cells$setCell(7, 4, cellType="cell", rawValue=train_mon_prmse)
+compare_table$cells$setCell(7, 5, cellType="cell", rawValue=test_mon_prmse)
+
+compare_table$cells$setCell(8, 1, cellType="cell", rawValue="Laval")
+compare_table$cells$setCell(8, 2, cellType="cell", rawValue=train_lav_rmse)
+compare_table$cells$setCell(8, 3, cellType="cell", rawValue=test_lav_rmse)
+compare_table$cells$setCell(8, 4, cellType="cell", rawValue=train_lav_prmse)
+compare_table$cells$setCell(8, 5, cellType="cell", rawValue=test_lav_prmse)
+
+compare_table$renderTable()
+```
+
+```{r}
+vip::vi(pmodel)
+vip::vi(pmodel_nocity)
+vip::vi(model_cal)
+vip::vi(model_pee)
+vip::vi(model_tor)
+vip::vi(model_mon)
+vip::vi(model_lav)
+```
