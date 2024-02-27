@@ -52,6 +52,7 @@ version$version.string
 ```
 
 ```{r }
+library(plyr)
 library(conflicted)
 library(sf)
 library(rpart)
@@ -66,6 +67,9 @@ library(table1)
 library(flextable)
 library(partykit)
 library(basictabler)
+library(plotmo)
+library(ggplot2)
+library(data.table)
 ```
 
 Included packages:
@@ -117,9 +121,18 @@ label(collision_dta$road_sum) = "Length of roadway"
 label(collision_dta$collisions_anu) = "Number of collisions per year"
 label(factor.collisions_class) = "Grouped # of collisions per year"
 
+my.render.cont = function(x) {
+    with(stats.default(x), 
+         c("",
+          "Mean (SD)" = sprintf("%s (%s)",
+                                       round_pad(MEAN, 2), 
+                                       round_pad(SD, 2)))
+    )
+}
+
 table1(~ area + child_pro + immigrant_recent_prop + house_den + entropie + school_num + road_sum + collisions_anu + factor.collisions_class| city,
        data = collision_dta,
-       render.continuous = "mean (sd)",
+       render.continuous = my.render.cont,
        #render.categorical,
        caption = "Table 1. Characteristics of dissemination areas, by city/region",
        footnote = "Note: Data are the mean (sd) averaged accross all dissemination areas in each city/region."
@@ -137,9 +150,18 @@ label(collision_dta$road_sum) = "Length of roadway"
 label(collision_dta$collisions_anu) = "Number of collisions per year"
 label(factor.collisions_class) = "Grouped # of collisions per year"
 
+my.render.cont = function(x) {
+    with(stats.default(x), 
+         c("",
+          "Median (IQR)" = sprintf("%s (%s)",
+                                       round_pad(MEDIAN, 2), 
+                                       round_pad(IQR, 2)))
+    )
+}
+
 table1(~ area + child_pro + immigrant_recent_prop + house_den + entropie + school_num + road_sum + collisions_anu + factor.collisions_class| city,
        data = collision_dta,
-       render.continuous = "median (iqr)",
+       render.continuous = my.render.cont,
        #render.categorical,
        caption = "Table 1. Characteristics of dissemination areas, by city/region",
        footnote = "Note: Data are the median (iqr) accross all dissemination areas in each city/region."
@@ -161,7 +183,7 @@ This code removes all variations of the outcome variable.
 collision_df = subset(collision_dta,
   select = -c(collisions_anu_per, collisions_class, collisions_class_anu, collisions,
               years, province, dissemination_area,
-              guards_num, guard_prop
+              guards_num, guard_den, school_num, school_den
               ))
 ```
 
@@ -196,12 +218,13 @@ As the outcome variable is a count (number of collisions), we will be using a Po
 ```{r}
 # This chunk specifies the control pieces of the model. As there are multiple models being built using the same characteristics, this saves space
 minsplit = 20
+cp = 0.001
 
 control = rpart.control(
   xval = 10,  
-  minsplit = 20,
+  minsplit = minsplit,
   minbucket = round(minsplit/3),
-  cp = 0.01,
+  cp = cp,
   maxcompete = 4, 
   maxsurrogate = 5, 
   usesurrogate = 2, 
@@ -229,10 +252,16 @@ model_nocity = rpart(
 
 ```{r include = T}
 rpart.plot(model,
-           main = "Poisson Regression Tree of Collisions per year"
+           main = "Poisson Regression Tree of Collisions per year",
+           yesno = 2,
+           box.palette = "-RdYlGn",
+           ycompact = TRUE
+           #branch = 0.3
            )
 rpart.plot(model_nocity,
-           main = "Poisson Regression Tree of Collisions per year (without city variable)"
+           main = "Poisson Regression Tree of Collisions per year (without city variable)",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 ```
 
@@ -344,14 +373,38 @@ print(mincp_nocity)
 
 So here is our final tree:
 ```{r include = T}
+png(filename = "nationalmodel_pruned",
+   res = 600, 
+   width=5600, height=5000)
 rpart.plot(pmodel,
-           main = "Poisson Regression Tree of Collisions per year, Pruned"
+           #main = "Poisson Regression Tree of Collisions per year, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
-rpart.plot(pmodel_nocity,
-           main = "Poisson Regression Tree of Collisions per year, Pruned (No city variable)"
+rpart.plot(pmodel,
+           #main = "Poisson Regression Tree of Collisions per year, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 ```
+```{r National model no city  pruned 1}
+png(filename = "nationalmodel_nocity_pruned",
+    res = 600, width=5600, height=5000)
+rpart.plot(pmodel_nocity,
+           #main = "Poisson Regression Tree of Collisions per year, Pruned (No city variable)",
+            yesno = 2,
+           box.palette = "-RdYlGn",
+           )
 
+```
+
+```{r National model no city pruned 2}
+rpart.plot(pmodel_nocity,
+           #main = "Poisson Regression Tree of Collisions per year, Pruned (No city variable)",
+            yesno = 2,
+           box.palette = "-RdYlGn",
+           )
+```
 
 ```{r}
 set.seed(seed)
@@ -485,19 +538,29 @@ model_lav = rpart(
 
 ```{r include = T}
 rpart.plot(model_cal,
-           main = "Poisson Regression Tree of Collisions per year in Calgary"
+           main = "Poisson Regression Tree of Collisions per year in Calgary",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(model_pee,
-           main = "Poisson Regression Tree of Collisions per year in Peel Region"
+           main = "Poisson Regression Tree of Collisions per year in Peel Region",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(model_tor,
-           main = "Poisson Regression Tree of Collisions per year in Toronto"
+           main = "Poisson Regression Tree of Collisions per year in Toronto",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(model_mon,
-           main = "Poisson Regression Tree of Collisions per year in Montreal"
+           main = "Poisson Regression Tree of Collisions per year in Montreal",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(model_lav,
-           main = "Poisson Regression Tree of Collisions per year in Laval"
+           main = "Poisson Regression Tree of Collisions per year in Laval",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 ```
 
@@ -649,19 +712,29 @@ print(paste("Laval mincp:", mincp_lav))
 
 ```{r include = T}
 rpart.plot(pmodel_cal,
-           main = "Poisson Regression Tree of Collisions per year in Calgary, Pruned"
+           main = "Poisson Regression Tree of Collisions per year in Calgary, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(pmodel_pee,
-           main = "Poisson Regression Tree of Collisions per year in Peel Region, Pruned"
+           main = "Poisson Regression Tree of Collisions per year in Peel Region, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(pmodel_tor,
-           main = "Poisson Regression Tree of Collisions per year in Toronto, Pruned"
+           main = "Poisson Regression Tree of Collisions per year in Toronto, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(pmodel_mon,
-           main = "Poisson Regression Tree of Collisions per year in Montreal, Pruned"
+           main = "Poisson Regression Tree of Collisions per year in Montreal, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 rpart.plot(pmodel_lav,
-           main = "Poisson Regression Tree of Collisions per year in Laval, Pruned"
+           main = "Poisson Regression Tree of Collisions per year in Laval, Pruned",
+           yesno = 2,
+           box.palette = "-RdYlGn",
            )
 ```
 
@@ -863,4 +936,72 @@ vip::vi(model_pee)
 vip::vi(model_tor)
 vip::vi(model_mon)
 vip::vi(model_lav)
+
+set.seed(seed)
+df_pmodel = as.data.frame(vip::vi(pmodel))
+df_pmodel_nocity = as.data.frame(vip::vi(pmodel_nocity))
+df_pmodel_cal = as.data.frame(vip::vi(pmodel_cal))
+df_pmodel_tor = as.data.frame(vip::vi(pmodel_tor))
+df_pmodel_pee = as.data.frame(vip::vi(pmodel_pee))
+df_pmodel_lav = as.data.frame(vip::vi(pmodel_lav))
+df_pmodel_mon = as.data.frame(vip::vi(pmodel_mon))
+
+colnames(df_pmodel) = c("Variable", "National")
+colnames(df_pmodel_nocity) = c("Variable", "National, No City")
+colnames(df_pmodel_cal) = c("Variable", "Calgary")
+colnames(df_pmodel_tor) = c("Variable", "Toronto")
+colnames(df_pmodel_pee) = c("Variable", "Peel Region")
+colnames(df_pmodel_lav) = c("Variable", "Laval")
+colnames(df_pmodel_mon) = c("Variable", "Montreal")
+```
+
+```{r}
+df_pimportance = join_all(list(df_pmodel,df_pmodel_nocity, df_pmodel_cal, df_pmodel_tor, df_pmodel_pee,df_pmodel_lav,df_pmodel_mon), 
+         by='Variable', type='full'
+         )
+#view(df_pimportance)
+```
+
+```{r}
+#df_pimportance$group = select(df_pimportance,"Variable")
+df_pimportanceplot = df_pimportance
+rownames(df_pimportanceplot) = (df_pimportanceplot[,1])
+df_pimportanceplot = df_pimportanceplot[,-1]
+df_pimportanceplot$predictor = row.names(df_pimportanceplot)
+dat.m = melt(df_pimportanceplot)
+#dat.m = dat.m[dat.m$value>0.10,]
+dat.m$color = ifelse(dat.m$variable=="National","Red",ifelse(dat.m$variable=="National, No City","Green",ifelse(dat.m$variable=="Calgary","Blue",ifelse(dat.m$variable=="Toronto","Yellow",ifelse(dat.m$variable=="Peel Region","Orange",ifelse(dat.m$variable=="Laval","Violet",ifelse(dat.m$variable=="Montreal","Grey","")))))))
+dat.m
+```
+
+```{r include = T}
+#df_pimportance$group = select(df_pimportance,"Variable")
+
+#impmodel = 
+
+df_pimportanceplot = df_pimportance
+rownames(df_pimportanceplot) = (df_pimportanceplot[,1])
+df_pimportanceplot = df_pimportanceplot[,-1]
+df_pimportanceplot$Predictor = row.names(df_pimportanceplot)
+dat.m = melt(df_pimportanceplot)
+impplot = ggplot(dat.m, aes(value, y=reorder(Predictor,value,na.rm=TRUE))) + labs(y="Predictors", x="Importance Score", color = "Model") + geom_point(aes(colour = variable, width = 5, height = 10))
+ggsave(impplot, filename = "C:\\Users\\tateh\\OneDrive - University of Calgary\\Tate HubkaRao - PhD\\Projects\\ML Project\\Analysis\\MVC Importance Score Dot Plot.png", width = 10, height = 10)
+impplot
+
+# + labs(y="Predictors", x="Importance Score" 
+#geom_jitter(colour=dat.m$color, size=0.4, alpha=0.9) 
+#impplot + geom_boxplot() 
+```
+```{r}
+combined_testdf = cbind(predict_ptest, test)
+combined_traindf = cbind(predict_ptrain, train)
+
+combined_testdf = dplyr::rename(combined_testdf, c("predicted"="predict_ptest"))
+combined_traindf = dplyr::rename(combined_traindf, c("predicted"="predict_ptrain"))
+
+collision_merge_df = rbind(combined_testdf, combined_traindf)
+
+collision_final_df = cbind(collision_merge_df, collision_dta[,c("dissemination_area","collisions")])
+
+write.csv(collision_final_df, "C:\\Users\\tateh\\OneDrive - University of Calgary\\Tate HubkaRao - PhD\\Projects\\ML Project\\Analysis\\Predicted Collisions.csv")
 ```
